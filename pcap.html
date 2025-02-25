@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>PCAP Graph Visualizer</title>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.2/vis-network.min.css" rel="stylesheet">
+  <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+  <style>
+    body { font-family: sans-serif; margin: 0; padding: 0; }
+    #controls { padding: 10px; background: #f0f0f0; }
+    #graph { width: 100%; height: calc(100vh - 50px); border: none; }
+    button, select { font-size: 16px; margin-right: 10px; }
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <button id="fsToggle">Toggle Fullscreen</button>
+    <label for="layoutSelect">Layout:</label>
+    <select id="layoutSelect">
+      <option value="default">Default</option>
+      <option value="hierarchical">Hierarchical</option>
+      <option value="circular">Circular</option>
+    </select>
+    <input type="file" id="pcapFile" accept=".pcap">
+  </div>
+  <div id="graph"></div>
+  <script>
+    let currentNodes = null, currentEdges = null;
+    document.getElementById('pcapFile').addEventListener('change', function(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        const arrayBuffer = e.target.result;
+        parsePcap(arrayBuffer);
+      };
+      reader.readAsArrayBuffer(file);
+    });
+    document.getElementById('layoutSelect').addEventListener('change', function() {
+      if (currentNodes && currentEdges) updateLayout();
+    });
+    document.getElementById('fsToggle').addEventListener('click', function() {
+      const elem = document.getElementById('graph');
+      if (!document.fullscreenElement) {
+        elem.requestFullscreen().catch(err => console.log(err));
+      } else {
+        document.exitFullscreen();
+      }
+    });
+    function parsePcap(buffer) {
+      const dataView = new DataView(buffer);
+      let offset = 0;
+      if (dataView.byteLength < 24) { console.error("Invalid PCAP file: too short."); return; }
+      const magic = dataView.getUint32(offset, false);
+      let littleEndian = false;
+      if (magic === 0xa1b2c3d4) { littleEndian = false; }
+      else if (magic === 0xd4c3b2a1) { littleEndian = true; }
+      else { console.error("Unknown or unsupported PCAP format. Magic: " + magic.toString(16)); return; }
+      offset += 24;
+      const graph = {};
+      while (offset + 16 <= dataView.byteLength) {
+        const incl_len = dataView.getUint32(offset + 8, littleEndian);
+        offset += 16;
+        if (offset + incl_len > dataView.byteLength) { console.warn("Truncated packet."); break; }
+        const packetDataOffset = offset;
+        if (incl_len < 14) { offset += incl_len; continue; }
+        const etherType = (dataView.getUint8(packetDataOffset + 12) << 8) | dataView.getUint8(packetDataOffset + 13);
+        if (etherType !== 0x0800) { offset += incl_len; continue; }
+        if (incl_len < 14 + 20) { offset += incl_len; continue; }
+        const ipHeaderOffset = packetDataOffset + 14;
+        const ihl = dataView.getUint8(ipHeaderOffset) & 0x0f;
+        const ipHeaderLength = ihl * 4;
+        if (incl_len < 14 + ipHeaderLength) { offset += incl_len; continue; }
+        const srcIP = [];
+        for (let i = 0; i < 4; i++) { srcIP.push(dataView.getUint8(ipHeaderOffset + 12 + i)); }
+        const srcIPStr = srcIP.join('.');
+        const dstIP = [];
+        for (let i = 0; i < 4; i++) { dstIP.push(dataView.getUint8(ipHeaderOffset + 16 + i)); }
+        const dstIPStr = dstIP.join('.');
+        if (!graph[srcIPStr]) { graph[srcIPStr] = new Set(); }
+        graph[srcIPStr].add(dstIPStr);
+        offset += incl_len;
+      }
+      const nodes = [];
+      const edges = [];
+      const addedNodes = new Set();
+      const nodeSize = 60, borderRadius = nodeSize / 2;
+      for (const src in graph) {
+        if (!addedNodes.has(src)) {
+          nodes.push({ 
+            id: src, 
+            label: src,
+            shape: 'box',
+            shapeProperties: { borderRadius: borderRadius },
+            widthConstraint: { min: nodeSize, max: nodeSize },
+            heightConstraint: { min: nodeSize, max: nodeSize },
+            color: { background: '#1E90FF', border: '#104E8B' },
+            font: { color: '#fff', size: 12 }
+          });
+          addedNodes.add(src);
+        }
+        graph[src].forEach(dst => {
+          if (!addedNodes.has(dst)) {
+            nodes.push({ 
+              id: dst, 
+              label: dst,
+              shape: 'box',
+              shapeProperties: { borderRadius: borderRadius },
+              widthConstraint: { min: nodeSize, max: nodeSize },
+              heightConstraint: { min: nodeSize, max: nodeSize },
+              color: { background: '#1E90FF', border: '#104E8B' },
+              font: { color: '#fff', size: 12 }
+            });
+            addedNodes.add(dst);
+          }
+          edges.push({ from: src, to: dst });
+        });
+      }
+      currentNodes = nodes;
+      currentEdges = edges;
+      updateLayout();
+    }
+    function updateLayout() {
+      const layoutType = document.getElementById('layoutSelect').value;
+      let options = { layout: { hierarchical: false }, physics: true };
+      let nodes = JSON.parse(JSON.stringify(currentNodes));
+      if (layoutType === "hierarchical") {
+        options.layout = { hierarchical: { enabled: true, direction: "UD", sortMethod: "directed" } };
+        options.physics = false;
+      } else if (layoutType === "circular") {
+        const centerX = 400, centerY = 300, radius = 200;
+        const total = nodes.length;
+        nodes.forEach((node, i) => {
+          const angle = (2 * Math.PI / total) * i;
+          node.x = centerX + radius * Math.cos(angle);
+          node.y = centerY + radius * Math.sin(angle);
+        });
+        options.physics = false;
+      }
+      drawGraph(nodes, currentEdges, options);
+    }
+    function drawGraph(nodes, edges, options) {
+      const container = document.getElementById('graph');
+      const data = {
+        nodes: new vis.DataSet(nodes),
+        edges: new vis.DataSet(edges)
+      };
+      new vis.Network(container, data, options);
+    }
+  </script>
+</body>
+</html>
